@@ -1,0 +1,460 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>POTF</title>
+  <script src="https://cdn.jsdelivr.net/npm/exceljs/dist/exceljs.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/file-saver@2.0.5/dist/FileSaver.min.js"></script>
+  <style>
+    body { font-family: 'Segoe UI', sans-serif; margin: 0; background: #fefefe; color: #333; }
+    header { background: #b2d8d8; color: #004d4d; padding: 1rem; text-align: center; }
+    main { max-width: 1000px; margin: auto; padding: 1rem; }
+    .card { background: #fff; border: 1px solid #e0e0e0; padding: 1rem; border-radius: 10px; margin-bottom: 1rem; box-shadow: 0 2px 6px rgba(0,0,0,0.05); }
+    textarea, input { width: 100%; padding: 10px; margin-top: 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 1rem; box-sizing: border-box; }
+    button { background: #a3c9a8; color: #033; font-weight: bold; border: none; cursor: pointer; padding: 10px; width: auto; }
+    button:hover { background: #8bb894; }
+    button.btn-reset { background: #eee; color: #333; }
+    button.btn-reset:hover { background: #ddd; }
+    .modal-bg { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); display: none; justify-content: center; align-items: center; z-index: 1000; }
+    .modal { background: white; padding: 20px; border-radius: 10px; width: 350px; }
+    .modal input { box-sizing: border-box; width: 100%; margin-bottom: 8px; }
+    .modal-buttons { display: flex; justify-content: flex-end; gap: 10px; }
+    .actions { font-size: 0.9em; margin-top: 0.5rem; }
+    .kpis { display: flex; flex-wrap: wrap; gap: 10px; padding: 1rem 0; font-size: 0.95rem; background: #f3f9f9; border-radius: 8px; }
+    .kpis div { flex: 1; min-width: 120px; background: #e4f0e0; padding: 10px; border-radius: 5px; text-align: center; }
+    .requirement { border-bottom: 1px solid #ddd; margin-bottom: 15px; padding-bottom: 10px; }
+    .action-item { display: flex; justify-content: space-between; background: #f8f8f8; padding: 5px; margin: 5px 0; border-radius: 5px; align-items: center; }
+    .action-item.invalid { background-color: #ffdede; }
+    .error-list { color: #c00; font-size: 0.8em; margin-top: 4px; display: flex; flex-direction: column; }
+    .error-list span { display: inline-flex; align-items: center; }
+    .error-list button { background: none; border: none; padding: 0 4px; margin-left: 6px; font-size: 0.75em; line-height: 1; cursor: pointer; }
+    .add-action-btn { margin-top: 6px; }
+  </style>
+</head>
+<body>
+<header>
+  <h2>📌 Project On The Fly</h2>
+  <button id="generateBtn">📥 Generate Gantt</button>
+</header>
+<main>
+  <div class="card">
+    <label>Project start date:</label>
+    <input type="date" id="startDate">
+  </div>
+  <div class="card">
+    <label>Requirements (one per line):</label>
+    <textarea id="requirementInput" rows="5"></textarea>
+    <button id="initBtn">Confirm requirements</button>
+    <button id="resetBtn" class="btn-reset" style="display:none">Reset</button>
+  </div>
+  <div class="kpis" id="kpis"></div>
+  <div class="card" id="requirementContainer" style="max-height: 600px; overflow-y: auto;"></div>
+</main>
+<div class="modal-bg" id="modalBg">
+  <div class="modal">
+    <h3>New action</h3>
+    <input type="text" id="actionName" placeholder="Action name">
+    <input type="number" id="actionStart" placeholder="Start (start offset)">
+    <input type="number" id="actionDuration" placeholder="Duration (days)">
+    <input type="text" id="r" placeholder="Responsible (R)">
+    <input type="text" id="a" placeholder="Accountable (A)">
+    <input type="text" id="c" placeholder="Consulted (C)">
+    <input type="text" id="i" placeholder="Informed (I)">
+    <div class="modal-buttons">
+      <button onclick="closeModal()">Cancel</button>
+      <button onclick="saveAction()">Save</button>
+    </div>
+  </div>
+</div>
+<div class="modal-bg" id="actorModal">
+  <div class="modal">
+    <h3>Actors</h3>
+    <div id="actorList"></div>
+    <div class="modal-buttons">
+      <button onclick="closeActorModal()">Close</button>
+    </div>
+  </div>
+</div>
+<script>
+const DB_NAME = 'potfDB', STORE = 'state';
+function openDB() { return new Promise((res, rej) => { const req = indexedDB.open(DB_NAME, 1); req.onupgradeneeded = () => req.result.createObjectStore(STORE); req.onsuccess = () => res(req.result); req.onerror = () => rej(req.error); }); }
+async function saveStateDB(state) { const db = await openDB(); const tx = db.transaction(STORE, 'readwrite'); tx.objectStore(STORE).put(state, 'pmState'); return new Promise(ok => { tx.oncomplete = ok; }); }
+async function loadStateDB() { const db = await openDB(); return new Promise(resolve => { const tx = db.transaction(STORE, 'readonly'); const get = tx.objectStore(STORE).get('pmState'); get.onsuccess = () => resolve(get.result); get.onerror = () => resolve(null); }); }
+async function clearStateDB() {
+  return new Promise((resolve, reject) => {
+    const delReq = indexedDB.deleteDatabase(DB_NAME);
+    delReq.onsuccess = () => resolve();
+    delReq.onerror   = () => reject(delReq.error);
+    delReq.onblocked = () => console.warn('DB deletion blocked');
+  });
+}
+let ignoredErrors = {}, requirements = [], currentRequirementId = null, editingAction = null, errorFilterActive = false;
+const container = document.getElementById('requirementContainer'), BATCH_SIZE = 20;
+const resetBtn   = document.getElementById('resetBtn');
+let loadedIndex = 0;
+async function saveState() { await saveStateDB({ startDate: document.getElementById('startDate').value, requirements, ignoredErrors }); }
+async function loadState() { const state = await loadStateDB(); if (state) { if (state.startDate) document.getElementById('startDate').value = state.startDate; requirements = state.requirements || []; sanitizeActionRoles(); ignoredErrors = state.ignoredErrors || {}; if (requirements.length) setupAfterLoad(); } }
+function setupAfterLoad() {
+  const ta = document.getElementById('requirementInput');
+  ta.value = requirements.map(e => e.name).join('\n');
+  ta.disabled = true;
+  document.getElementById('initBtn').style.display = 'none';
+  resetBtn.style.display = 'inline-block';
+  container.innerHTML = '';
+  loadedIndex = 0;
+  loadMoreRequirements();
+}
+window.addEventListener('DOMContentLoaded', async () => {
+  await loadState();
+  if (!requirements.length) loadMoreRequirements();
+  container.addEventListener('scroll', () => { if (container.scrollTop + container.clientHeight >= container.scrollHeight - 50) loadMoreRequirements(); });
+  document.getElementById('initBtn').addEventListener('click', initRequirementLoading);
+    resetBtn.addEventListener('click', async () => {
+      if (!confirm('Do you really want to reset all requirements?')) return;
+      await clearStateDB();
+      location.reload();
+    });
+
+  document.getElementById('generateBtn').addEventListener('click', generateExcel);
+});
+function initRequirementLoading() {
+  requirements = [];
+  loadedIndex = 0;
+  const lines = document.getElementById('requirementInput').value.trim().split('\n').filter(Boolean);
+  lines.forEach(n => requirements.push({ id: crypto.randomUUID(), name: n, actions: [] }));
+  container.innerHTML = '';
+  loadMoreRequirements();
+  document.getElementById('requirementInput').disabled = true;
+  document.getElementById('initBtn').style.display = 'none';
+  resetBtn.style.display = 'inline-block';
+
+  saveState();
+}
+function loadMoreRequirements(batch = BATCH_SIZE) {
+  const end = Math.min(requirements.length, loadedIndex + batch);
+
+  for (let i = loadedIndex; i < end; i++) {
+    const ex = requirements[i];
+
+    const div = document.createElement('div');
+    div.className = 'requirement';
+
+    // Create a vertical container for the title and the button
+    const header = document.createElement('div');
+    header.className = 'requirement-header';
+
+    const title = document.createElement('strong');
+    title.textContent = `${i + 1}. ${ex.name}`;
+
+    const addBtn = document.createElement('button');
+    addBtn.className = 'add-action-btn';
+    addBtn.textContent = '➕ Add action';
+    addBtn.addEventListener('click', () => openModal(ex.id));
+
+    header.appendChild(title);
+    header.appendChild(document.createElement('br')); // Force line break
+    header.appendChild(addBtn);
+
+    div.appendChild(header);
+
+    // Actions area
+    const actionsDiv = document.createElement('div');
+    actionsDiv.className = 'actions';
+    actionsDiv.id = `actions-${ex.id}`;
+    div.appendChild(actionsDiv);
+
+    container.appendChild(div);
+    renderActionsFor(ex);
+  }
+
+  loadedIndex = end;
+  updateKPIs();
+}
+function openModal(id) { currentRequirementId = id; editingAction = null; ['actionName','actionStart','actionDuration','r','a','c','i'].forEach(f => document.getElementById(f).value = ''); document.getElementById('modalBg').style.display = 'flex'; }
+function closeModal() { document.getElementById('modalBg').style.display = 'none'; }
+function saveAction() {
+  const name = document.getElementById('actionName').value.trim();
+  const startOffset = parseInt(document.getElementById('actionStart').value, 10);
+  const duration = parseInt(document.getElementById('actionDuration').value, 10);
+  const R = document.getElementById('r').value.trim();
+  const A = document.getElementById('a').value.trim();
+  const C = document.getElementById('c').value.trim();
+  const I = document.getElementById('i').value.trim();
+  if (!name || isNaN(startOffset) || isNaN(duration)) return;
+  const ex = requirements.find(e => e.id === currentRequirementId);
+  if (editingAction) {
+    const idx = ex.actions.findIndex(a => a.name === editingAction);
+    if (idx !== -1) ex.actions.splice(idx, 1);
+  }
+  ex.actions.push({ name, offset: startOffset, duration, R, A, C, I });
+  renderActionsFor(ex);
+  closeModal();
+  saveState();
+}
+function renderActionsFor(ex) {
+  const cont = document.getElementById(`actions-${ex.id}`);
+  cont.innerHTML = '';
+  ex.actions.forEach(a => cont.appendChild(renderAction(ex, a)));
+  updateKPIs();
+}
+function renderAction(ex, action) {
+  const base = getStartDate();
+  const start = new Date(base);
+  start.setDate(start.getDate() + action.offset);
+  const end = new Date(start);
+  end.setDate(end.getDate() + action.duration - 1);
+  const missing = ['R','A','C','I'].filter(r => !action[r] || !action[r].trim());
+  const ignored = ignoredErrors[action.name] || [];
+  const visible = missing.filter(r => !ignored.includes(r));
+  const div = document.createElement('div');
+  div.className = 'action-item' + (visible.length ? ' invalid' : '');
+  const left = document.createElement('div');
+  const nameEl = document.createElement('strong');
+  nameEl.textContent = action.name;
+  left.appendChild(nameEl);
+  left.appendChild(document.createElement('br'));
+  const dateEl = document.createElement('small');
+  dateEl.textContent = `${start.toLocaleDateString()} ➜ ${end.toLocaleDateString()}`;
+  left.appendChild(dateEl);
+  if (visible.length) {
+    const errList = document.createElement('div');
+    errList.className = 'error-list';
+    visible.forEach(r => {
+      const span = document.createElement('span');
+      span.textContent = `${roleLabel(r)} missing`;
+      const btn = document.createElement('button');
+      btn.textContent = '✖';
+      btn.addEventListener('click', () => ignoreError(action.name, r));
+      span.appendChild(btn);
+      errList.appendChild(span);
+    });
+    left.appendChild(errList);
+  }
+  const right = document.createElement('div');
+  const editBtn = document.createElement('button');
+  editBtn.textContent = '✏️';
+  editBtn.addEventListener('click', () => editAction(ex.id, action.name));
+  const delBtn = document.createElement('button');
+  delBtn.textContent = '🗑️';
+  delBtn.addEventListener('click', () => deleteAction(ex.id, action.name));
+  right.appendChild(editBtn);
+  right.appendChild(delBtn);
+  div.appendChild(left);
+  div.appendChild(right);
+  return div;
+}
+function roleLabel(r) { return { R: 'Responsible', A: 'Accountable', C: 'Consulted', I: 'Informed' }[r]; }
+function editAction(exId, name) {
+  const ex = requirements.find(e => e.id === exId);
+  const a = ex.actions.find(x => x.name === name);
+  currentRequirementId = exId;
+  editingAction = name;
+  document.getElementById('actionName').value = a.name;
+  document.getElementById('actionStart').value = a.offset;
+  document.getElementById('actionDuration').value = a.duration;
+  ['R','A','C','I'].forEach(role => document.getElementById(role.toLowerCase()).value = a[role] || '');
+  document.getElementById('modalBg').style.display = 'flex';
+}
+function deleteAction(exId, name) {
+  const ex = requirements.find(e => e.id === exId);
+  ex.actions = ex.actions.filter(a => a.name !== name);
+  renderActionsFor(ex);
+  saveState();
+}
+function updateKPIs() {
+  const kpisEl = document.getElementById('kpis');
+  kpisEl.innerHTML = '';
+  const total = requirements.length;
+  const withA = requirements.filter(e => e.actions.length).length;
+  const withoutA = total - withA;
+  const actions = requirements.flatMap(e => e.actions);
+  const actors = new Set(actions.flatMap(a => [a.R,a.A,a.C,a.I].join(',').split(',').map(p => p.trim()).filter(Boolean)));
+  const times = actions.flatMap(a => {
+    const base = getStartDate();
+    const s = new Date(base);
+    s.setDate(s.getDate() + a.offset);
+    const e = new Date(s);
+    e.setDate(e.getDate() + a.duration - 1);
+    return [s.getTime(), e.getTime()];
+  });
+  const duration = times.length ? Math.ceil((Math.max(...times) - Math.min(...times)) / 86400000) + 1 : 0;
+  const errors = actions.filter(a => {
+    const m = ['R','A','C','I'].filter(r => !a[r] || !a[r].trim());
+    const ign = ignoredErrors[a.name] || [];
+    return m.filter(r => !ign.includes(r)).length;
+  }).length;
+  const createKpi = (label, value, clickable, handler) => {
+    const d = document.createElement('div');
+    if (clickable) { d.style.cursor = 'pointer'; d.addEventListener('click', handler); }
+    d.innerHTML = `${label}: <strong>${value}</strong>`;
+    return d;
+  };
+  kpisEl.appendChild(createKpi('Total requirements', total));
+  kpisEl.appendChild(createKpi('With actions', withA));
+  kpisEl.appendChild(createKpi('Without actions', withoutA));
+  kpisEl.appendChild(createKpi('Total actions', actions.length));
+  kpisEl.appendChild(createKpi('Unique actors', actors.size, true, openActorModal));
+  kpisEl.appendChild(createKpi('Total project duration', `${duration} days`));
+  if (errors) {
+    const div = createKpi('🛑 Actions with errors', errors);
+    const btn = document.createElement('button');
+    btn.textContent = errorFilterActive ? '↩️' : '👁️';
+    btn.addEventListener('click', toggleErrorFilter);
+    div.appendChild(btn);
+    kpisEl.appendChild(div);
+  } else {
+    kpisEl.appendChild(createKpi('🛑 Actions with errors', errors));
+  }
+}
+function toggleErrorFilter() {
+  errorFilterActive = !errorFilterActive;
+  document.querySelectorAll('.action-item').forEach(el => {
+    if (!el.classList.contains('invalid')) {
+      el.style.display = errorFilterActive ? 'none' : '';
+    } else {
+      el.style.display = '';
+    }
+  });
+  document.querySelectorAll('.requirement').forEach(exEl => {
+    const hasInvalid = exEl.querySelector('.action-item.invalid') !== null;
+    exEl.style.display = errorFilterActive ? (hasInvalid ? '' : 'none') : '';
+  });
+  updateKPIs();
+}
+function ignoreError(name, role) {
+  if (!ignoredErrors[name]) ignoredErrors[name] = [];
+  ignoredErrors[name].push(role);
+  renderAllRequirements();
+  saveState();
+}
+function openActorModal() {
+  sanitizeActionRoles();
+  const all = new Set();
+  requirements.forEach(ex => ex.actions.forEach(a => ['R','A','C','I'].forEach(role => {
+    const val = a[role];
+    if (typeof val === 'string' && val.trim()) {
+      val.split(',').map(s => s.trim()).filter(Boolean).forEach(p => all.add(p));
+    }
+  })));
+  const list = document.getElementById('actorList');
+  list.innerHTML = '';
+  all.forEach(name => {
+    const row = document.createElement('div');
+    row.innerHTML = `
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;">
+        <input type="text" value="${name}" />
+        <button>✖</button>
+      </div>
+    `;
+    const inp = row.querySelector('input');
+    const btn = row.querySelector('button');
+    inp.addEventListener('change', () => renameActor(name, inp.value));
+    btn.addEventListener('click', () => deleteActor(name));
+    list.appendChild(row);
+  });
+  document.getElementById('actorModal').style.display = 'flex';
+}
+function sanitizeActionRoles() {
+  requirements.forEach(ex => ex.actions.forEach(a => ['R','A','C','I'].forEach(role => {
+    let val = typeof a[role] === 'string' ? a[role] : '';
+    val = val.replace(/undefined/g, '');
+    const cleaned = val.split(',').map(s => s.trim()).filter(Boolean);
+    a[role] = cleaned.join(', ');
+  })));
+}
+function renameActor(oldN, newN) {
+  requirements.forEach(ex => ex.actions.forEach(a => ['R','A','C','I'].forEach(r => {
+    a[r] = a[r].split(',').map(s => s.trim() === oldN ? newN : s.trim()).filter(Boolean).join(', ');
+  })));
+  renderAllRequirements();
+  saveState();
+}
+function deleteActor(name) {
+  requirements.forEach(ex => ex.actions.forEach(a => {
+    ['R','A','C','I'].forEach(role => {
+      const val = a[role];
+      if (typeof val === 'string' && val.trim()) {
+        a[role] = val.split(',').map(s => s.trim()).filter(p => p && p !== name).join(', ');
+      }
+    });
+    if (ignoredErrors[a.name]) delete ignoredErrors[a.name];
+  }));
+  renderAllRequirements();
+  saveState();
+  openActorModal();
+}
+function closeActorModal() { document.getElementById('actorModal').style.display = 'none'; }
+function renderAllRequirements() { sanitizeActionRoles(); container.innerHTML = ''; loadedIndex = 0; loadMoreRequirements(); }
+function parseLocalDate(input) { const [yyyy, mm, dd] = input.split('-').map(Number); return new Date(yyyy, mm - 1, dd); }
+function getStartDate() { const v = document.getElementById('startDate').value; return v ? parseLocalDate(v) : new Date(); }
+function formatDate(d) { const yyyy = d.getFullYear(); const mm = String(d.getMonth()+1).padStart(2,'0'); const dd = String(d.getDate()).padStart(2,'0'); return `${yyyy}-${mm}-${dd}`; }
+async function generateExcel() {
+  sanitizeActionRoles();
+  const wb = new ExcelJS.Workbook();
+  const ws = wb.addWorksheet("Data");
+  ws.columns = ["Requirement","Action","Start","End","R","A","C","I"].map(h => ({header: h, width: 20}));
+  const allRows = requirements.flatMap(e => e.actions.map(a => {
+    const base = getStartDate();
+    const s = new Date(base);
+    s.setDate(s.getDate() + a.offset);
+    const eDate = new Date(s);
+    eDate.setDate(eDate.getDate() + a.duration - 1);
+    return [e.name, a.name, formatDate(s), formatDate(eDate), a.R, a.A, a.C, a.I];
+  }));
+  allRows.forEach(row => ws.addRow(row));
+  const gantt = wb.addWorksheet("Gantt");
+  gantt.getCell("A1").value = "Task"; gantt.getColumn(1).width = 30;
+  const tasks = requirements.flatMap(ex => ex.actions.map(a => {
+    const base = getStartDate();
+    const s = new Date(base);
+    s.setDate(s.getDate() + a.offset);
+    const eDate = new Date(s);
+    eDate.setDate(eDate.getDate() + a.duration - 1);
+    return {name: a.name, start: s, end: eDate};
+  }));
+  if (tasks.length) {
+    let min = new Date(Math.min(...tasks.map(t => t.start)));
+    let max = new Date(Math.max(...tasks.map(t => t.end)));
+    let dates = [];
+    for (let d = new Date(min); d <= max; d.setDate(d.getDate()+1)) dates.push(new Date(d));
+    dates.forEach((d,i) => { gantt.getCell(1,i+2).value = formatDate(d); gantt.getColumn(i+2).width = 4; });
+    tasks.forEach((t,r) => {
+      gantt.getCell(r+2,1).value = t.name;
+      dates.forEach((d,c) => {
+        if (d >= t.start && d <= t.end) {
+          gantt.getCell(r+2,c+2).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFa3c9a8' } };
+        }
+      });
+    });
+  }
+  const raci = wb.addWorksheet("RACI");
+  raci.columns = [
+    { header: "Person", key: "person", width: 20 },
+    { header: "Role", key: "role", width: 20 },
+    { header: "Action", key: "action", width: 20 },
+    { header: "Requirement", key: "requirement", width: 20 },
+    { header: "Start", key: "start", width: 20 },
+    { header: "End", key: "end", width: 20 }
+  ];
+  requirements.flatMap(e => e.actions.flatMap(a =>
+    ["R","A","C","I"].flatMap(role => {
+      if (!a[role]) return [];
+      return a[role].split(",").map(p => p.trim()).filter(Boolean).map(person => {
+        const base = getStartDate();
+        const s = new Date(base);
+        s.setDate(s.getDate() + a.offset);
+        const eDate = new Date(s);
+        eDate.setDate(eDate.getDate() + a.duration - 1);
+        return {
+          person, role, action: a.name, requirement: e.name, start: formatDate(s), end: formatDate(eDate)
+        };
+      });
+    })
+  )).forEach(obj => raci.addRow(obj));
+  const buf = await wb.xlsx.writeBuffer();
+  saveAs(new Blob([buf]), 'ProjectOnTheFly.xlsx');
+}
+</script>
+</body>
+</html>
